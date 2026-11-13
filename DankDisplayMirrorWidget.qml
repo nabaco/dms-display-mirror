@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
+import Quickshell.Wayland
 import qs.Common
 import qs.Services
 import qs.Widgets
@@ -12,78 +13,309 @@ PluginComponent {
 
     property bool autoRefresh: pluginData.autoRefresh ?? false
     property int refreshInterval: pluginData.refreshInterval || 30
+    property string scalingMode: pluginData.scalingMode || "fit"
+    property string scalingFilter: pluginData.scalingFilter || "linear"
+
+    readonly property var scalingModeValues: ["fit", "cover", "exact"]
+    readonly property var scalingModeLabels: ["Fit", "Cover", "Exact"]
+    readonly property var scalingFilterValues: ["linear", "nearest"]
+    readonly property var scalingFilterLabels: ["Linear", "Nearest"]
 
     // Reactive list of all connected outputs. Updates automatically on hotplug, so no manual refresh is required.
     property var monitors: Quickshell.screens.map(s => s.name)
-    property bool isLoading: false
-    property bool justStartedMirror: false  // Track if we just started a mirror vs checking status
-    property string lastStartedSource: ""   // Track which source we just started mirroring
     property bool wlMirrorInstalled: true
-    
-    // Use shared singleton state so all widget instances see the same values
-    // activeMirrors structure: {pid: {source: "outputName", target: "outputName"}}
+    property bool slurpInstalled: true
+
+    // Use shared singleton state so all widget instances see the same values, and
+    // so scaling changes made from one surface (bar/CC) reach the process
+    // regardless of which surface originally started the mirror.
+    // activeMirrors structure: {id: {source, target, scalingMode, scalingFilter, region, zoom, pid}}
     readonly property var activeMirrors: MirrorState.activeMirrors
     readonly property bool hasActiveMirrors: MirrorState.hasActiveMirrors
     readonly property int activeMirrorCount: MirrorState.activeMirrorCount
-    property string lastMirrorOutput: ""
     property string lastMirrorError: ""
     property string currentFocusedOutput: ""
     // Incremented whenever mirror state changes to force dependent bindings to reevaluate
     property int mirrorVersion: 0
 
-    // Helper functions to manage mirrors
-    function addMirror(pid, source, target) {
-        console.log("DisplayMirror: Adding mirror PID", pid, "source:", source, "target:", target)
-        var mirrors = Object.assign({}, MirrorState.activeMirrors)
-        mirrors[pid] = {source: source, target: target}
-        MirrorState.activeMirrors = mirrors
-    }
-    
-    function removeMirror(pid) {
-        console.log("DisplayMirror: Removing mirror PID", pid)
-        var mirrors = Object.assign({}, MirrorState.activeMirrors)
-        delete mirrors[pid]
-        MirrorState.activeMirrors = mirrors
-    }
-    
-    function getMirrorsBySource(sourceName) {
-        var result = []
-        var mirrors = Object.keys(MirrorState.activeMirrors)
-        for (let i = 0; i < mirrors.length; i++) {
-            const pid = mirrors[i]
-            const mirror = MirrorState.activeMirrors[pid]
-            if (mirror.source === sourceName) {
-                result.push({pid: pid, target: mirror.target})
-            }
+    // Explicit source/target selection, so a mirror can be started from any
+    // screen (e.g. mirror the laptop onto a beamer without going to the beamer).
+    // Empty string = "use the default" (see sourceChoice/targetChoice).
+    property string selectedSource: ""
+    property string selectedTarget: ""
+
+    // Displays currently covered by a running mirror window - they can neither
+    // be mirrored (you'd just see the mirror) nor receive a second mirror.
+    function busyTargets() {
+        void root.mirrorVersion
+        const busy = []
+        const ids = Object.keys(MirrorState.activeMirrors)
+        for (let i = 0; i < ids.length; i++) {
+            const mirror = MirrorState.activeMirrors[ids[i]]
+            if (mirror && mirror.target) busy.push(mirror.target)
         }
-        return result
+        return busy
     }
 
-    // Return monitors excluding the current focused/active display and any display currently being used as a mirror target
-    function filteredMonitors() {
-        if (!currentFocusedOutput) return monitors
-        
-        // Check if current display is already being used as a source
-        const pids = Object.keys(MirrorState.activeMirrors)
-        for (let i = 0; i < pids.length; i++) {
-            const mirror = MirrorState.activeMirrors[pids[i]]
-            if (mirror && mirror.source === currentFocusedOutput) {
-                // Current display is already mirroring, hide all available displays
-                return []
+    function sourceOptions() {
+        const busy = busyTargets()
+        return root.monitors.filter(m => busy.indexOf(m) === -1)
+    }
+
+    function targetOptions(source) {
+        const busy = busyTargets()
+        return root.monitors.filter(m => m !== source && busy.indexOf(m) === -1)
+    }
+
+    // Effective source: the user's pick if still valid, else the focused display
+    readonly property string sourceChoice: {
+        const opts = sourceOptions()
+        if (opts.indexOf(selectedSource) !== -1) return selectedSource
+        if (opts.indexOf(currentFocusedOutput) !== -1) return currentFocusedOutput
+        return opts.length > 0 ? opts[0] : ""
+    }
+
+    // Effective target: the user's pick if still valid, else the first other display
+    readonly property string targetChoice: {
+        const opts = targetOptions(sourceChoice)
+        if (opts.indexOf(selectedTarget) !== -1) return selectedTarget
+        return opts.length > 0 ? opts[0] : ""
+    }
+
+    // Human-readable name for an output, e.g. "HP M27fw FHD" instead of "DP-4".
+    // Laptop panels often report a bare hex product code, so call those "Built-in display".
+    function screenLabel(name) {
+        const screen = Quickshell.screens.find(s => s.name === name)
+        if (/^(eDP|LVDS|DSI)/.test(name) && (!screen || !screen.model || /^0x[0-9a-f]+$/i.test(screen.model)))
+            return "Built-in display"
+        return (screen && screen.model) ? screen.model : name
+    }
+
+    function screenDetail(name) {
+        const screen = Quickshell.screens.find(s => s.name === name)
+        return screen ? (name + " · " + screen.width + "×" + screen.height) : name
+    }
+
+    // ── Identify: big click-through label on every screen for a few seconds ──
+    property bool identifying: false
+
+    function identifyMonitors() {
+        root.identifying = true
+        identifyTimer.restart()
+    }
+
+    Timer {
+        id: identifyTimer
+        interval: 2000
+        onTriggered: root.identifying = false
+    }
+
+    LazyLoader {
+        active: root.identifying
+
+        Variants {
+            model: Quickshell.screens
+
+            PanelWindow {
+                id: identifyWindow
+                required property var modelData
+                screen: modelData
+
+                readonly property string role: modelData.name === root.sourceChoice ? "SOURCE"
+                                             : modelData.name === root.targetChoice ? "TARGET" : ""
+
+                color: "transparent"
+                exclusionMode: ExclusionMode.Ignore
+                WlrLayershell.layer: WlrLayer.Overlay
+                WlrLayershell.namespace: "dms:display-mirror-identify"
+                // Never take keyboard focus and let clicks pass straight through
+                WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+                mask: Region {}
+
+                implicitWidth: identifyCard.width
+                implicitHeight: identifyCard.height
+
+                Rectangle {
+                    id: identifyCard
+                    width: Math.max(identifyColumn.implicitWidth + 96, 360)
+                    height: identifyColumn.implicitHeight + 64
+                    radius: Theme.cornerRadius * 2
+                    color: Theme.withAlpha(Theme.surfaceContainer, 0.92)
+                    border.width: identifyWindow.role ? 3 : 1
+                    border.color: identifyWindow.role ? Theme.primary : Theme.outline
+
+                    Column {
+                        id: identifyColumn
+                        anchors.centerIn: parent
+                        spacing: Theme.spacingS
+
+                        StyledText {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            text: identifyWindow.modelData.name
+                            font.pixelSize: 96
+                            font.weight: Font.Bold
+                            color: identifyWindow.role ? Theme.primary : Theme.surfaceText
+                        }
+
+                        StyledText {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            text: root.screenLabel(identifyWindow.modelData.name)
+                            font.pixelSize: 28
+                            color: Theme.surfaceText
+                        }
+
+                        StyledText {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            text: identifyWindow.modelData.width + "×" + identifyWindow.modelData.height
+                                  + (identifyWindow.role ? "  ·  " + identifyWindow.role : "")
+                            font.pixelSize: 20
+                            color: Theme.surfaceVariantText
+                        }
+                    }
+                }
             }
         }
-        
-        // Get all displays currently being used as mirror targets
-        const targetDisplays = new Set()
-        for (let i = 0; i < pids.length; i++) {
-            const mirror = MirrorState.activeMirrors[pids[i]]
-            if (mirror && mirror.target) {
-                targetDisplays.add(mirror.target)
+    }
+
+    // One selectable display row in the picker
+    component MonitorRow: Rectangle {
+        id: row
+        property string output: ""
+        property bool selected: false
+        signal picked()
+
+        height: 44
+        radius: Theme.cornerRadius
+        color: selected ? Theme.primaryPressed
+             : rowArea.containsMouse ? Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.08)
+             : Theme.withAlpha(Theme.surfaceContainerHighest, Theme.popupTransparency)
+        border.width: selected ? 2 : 0
+        border.color: Theme.primary
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: Theme.spacingM
+            anchors.rightMargin: Theme.spacingM
+            spacing: Theme.spacingM
+
+            DankIcon {
+                name: /^(eDP|LVDS|DSI)/.test(row.output) ? "laptop" : "monitor"
+                size: Theme.iconSize
+                color: row.selected ? Theme.primary : Theme.surfaceVariantText
+                Layout.alignment: Qt.AlignVCenter
+            }
+
+            Column {
+                Layout.fillWidth: true
+                Layout.alignment: Qt.AlignVCenter
+                spacing: 0
+
+                StyledText {
+                    width: parent.width
+                    text: root.screenLabel(row.output)
+                    font.pixelSize: Theme.fontSizeMedium
+                    font.weight: Font.Medium
+                    color: row.selected ? Theme.primary : Theme.surfaceText
+                    elide: Text.ElideRight
+                }
+
+                StyledText {
+                    width: parent.width
+                    text: root.screenDetail(row.output)
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceVariantText
+                    elide: Text.ElideRight
+                }
+            }
+
+            DankIcon {
+                name: "check"
+                size: Theme.iconSize - 4
+                color: Theme.primary
+                visible: row.selected
+                Layout.alignment: Qt.AlignVCenter
             }
         }
-        
-        // Filter out current focused output and target displays
-        return monitors.filter(m => m !== currentFocusedOutput && !targetDisplays.has(m))
+
+        MouseArea {
+            id: rowArea
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: row.picked()
+        }
+    }
+
+    // Shared source/target picker, used by both the bar popout and the CC detail panel
+    component MirrorPicker: Column {
+        spacing: Theme.spacingS
+
+        DankButton {
+            width: parent.width
+            text: root.identifying ? "Identifying…" : "Identify displays"
+            iconName: "visibility"
+            onClicked: root.identifyMonitors()
+        }
+
+        StyledText {
+            text: "Source - what to show"
+            font.pixelSize: Theme.fontSizeSmall
+            font.weight: Font.Medium
+            color: Theme.surfaceVariantText
+            visible: root.sourceOptions().length > 0
+        }
+
+        Repeater {
+            model: root.sourceOptions()
+            delegate: MonitorRow {
+                required property string modelData
+                width: parent.width
+                output: modelData
+                selected: modelData === root.sourceChoice
+                onPicked: root.selectedSource = modelData
+            }
+        }
+
+        Item { width: 1; height: Theme.spacingXS }
+
+        StyledText {
+            text: "Target - where to show it"
+            font.pixelSize: Theme.fontSizeSmall
+            font.weight: Font.Medium
+            color: Theme.surfaceVariantText
+            visible: root.targetOptions(root.sourceChoice).length > 0
+        }
+
+        Repeater {
+            model: root.targetOptions(root.sourceChoice)
+            delegate: MonitorRow {
+                required property string modelData
+                width: parent.width
+                output: modelData
+                selected: modelData === root.targetChoice
+                onPicked: root.selectedTarget = modelData
+            }
+        }
+
+        Item { width: 1; height: Theme.spacingXS }
+
+        DankButton {
+            width: parent.width
+            visible: root.targetChoice !== ""
+            text: "Mirror " + root.sourceChoice + " → " + root.targetChoice
+            iconName: "screen_share"
+            onClicked: root.startMirror(root.sourceChoice, root.targetChoice)
+        }
+
+        StyledText {
+            width: parent.width
+            text: root.monitors.length === 0 ? "No displays found - make sure a DMS compatible compositor is running"
+                                             : "No free display to mirror to"
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
+            wrapMode: Text.WordWrap
+            visible: root.targetChoice === ""
+        }
     }
 
     // Control Center tile properties
@@ -108,23 +340,41 @@ PluginComponent {
         function onMirrorsChanged() {
             // Force a reevaluation by bumping version counter
             mirrorVersion++
-            console.log("DisplayMirror: mirrorsChanged received; version=" + mirrorVersion + ", count=" + MirrorState.activeMirrorCount)
         }
     }
 
     Component.onCompleted: {
-        console.log("DisplayMirror: Widget completed. activeMirrorCount:", activeMirrorCount, "hasActiveMirrors:", hasActiveMirrors)
         checkWlMirrorInstalled()
+        checkSlurpInstalled()
         refreshMonitors()
         detectFocusedOutput()
-        checkMirrorStatus()
+        // Pre-create the slurp result file so FileView has a stable inode to
+        // watch from the start (recreating it later would break the watch)
+        Quickshell.execDetached(["sh", "-c", "touch '" + root.slurpResultPath + "'"])
     }
 
     function checkWlMirrorInstalled() {
         wlMirrorCheckProcess.running = true
     }
 
-    // Removed redundant reassignment Connections; bindings are direct now
+    function checkSlurpInstalled() {
+        slurpCheckProcess.running = true
+    }
+
+    // Best-effort label for which output a slurp region falls on (region
+    // selection can span/land anywhere, this is just for display text)
+    function screenForRegion(regionStr) {
+        const m = regionStr.match(/^(-?\d+),(-?\d+)\s+(\d+)x(\d+)/)
+        if (!m) return null
+        const rx = parseInt(m[1]), ry = parseInt(m[2])
+        for (let i = 0; i < Quickshell.screens.length; i++) {
+            const s = Quickshell.screens[i]
+            if (rx >= s.x && rx < s.x + s.width && ry >= s.y && ry < s.y + s.height) {
+                return s.name
+            }
+        }
+        return null
+    }
 
     Timer {
         id: refreshTimer
@@ -132,10 +382,8 @@ PluginComponent {
         repeat: true
         running: root.autoRefresh
         onTriggered: {
-            if (!root.isLoading) {
-                root.refreshMonitors()
-                root.detectFocusedOutput()
-            }
+            root.refreshMonitors()
+            root.detectFocusedOutput()
         }
     }
 
@@ -143,7 +391,6 @@ PluginComponent {
         const screen = CompositorService.getFocusedScreen()
         if (screen && screen.name) {
             root.currentFocusedOutput = screen.name
-            console.log("DisplayMirror: Detected focused output:", screen.name)
         } else {
             console.warn("DisplayMirror: Could not detect focused output")
         }
@@ -154,8 +401,10 @@ PluginComponent {
         detectFocusedOutput()
     }
 
-    function startMirror(outputName) {
-        if (!outputName || isLoading) return
+    // Mirrors `source` onto `target`. Both are chosen explicitly in the picker,
+    // so this works from any screen - no need to be focused on the target.
+    function startMirror(source, target) {
+        if (!source || !target) return
 
         if (!root.wlMirrorInstalled) {
             lastMirrorError = "wl-mirror is not installed"
@@ -163,73 +412,82 @@ PluginComponent {
             return
         }
 
-        // Detect current focused output first
-        detectFocusedOutput()
-        
-        // Wait a moment for focus detection, then start mirror
-        Qt.callLater(() => {
-            const targetOutput = root.currentFocusedOutput
-            if (!targetOutput) {
-                console.warn("DisplayMirror: Could not detect target output")
-                lastMirrorError = "Could not detect current display"
-                return
-            }
-            
-            if (targetOutput === outputName) {
-                console.log("DisplayMirror: Cannot mirror display to itself")
-                lastMirrorError = "Cannot mirror a display to itself"
-                return
-            }
-
-            isLoading = true
-            justStartedMirror = true
-            lastStartedSource = outputName
-            lastMirrorError = ""
-            lastMirrorOutput = ""
-            
-            // Close the Control Center using the proper PopoutService API
-            // This prevents CC from staying open below the fullscreen wl-mirror window
-            PopoutService.closeControlCenter()
-            
-            // Launch wl-mirror in background, echo its PID
-            const safeOutput = outputName.replace(/"/g, '\\"')
-            mirrorProcess.command = ["sh", "-c", "wl-mirror --fullscreen \"" + safeOutput + "\" >/dev/null 2>&1 & echo $!"]
-            mirrorProcess.running = true
-        })
-    }
-
-    function stopMirror(pid) {
-        if (pid && MirrorState.activeMirrors[pid]) {
-            const mirror = MirrorState.activeMirrors[pid]
-            console.log("DisplayMirror: Stopping mirror PID", pid, "source:", mirror.source, "target:", mirror.target)
-            Quickshell.execDetached(["sh", "-c", "kill " + pid + " 2>/dev/null"])
-            removeMirror(pid)
-            Quickshell.execDetached(["sh", "-c", "notify-send 'Display Mirror' 'Stopped mirroring " + mirror.source + " → " + mirror.target + "' -u low"])
+        if (source === target) {
+            lastMirrorError = "Cannot mirror a display to itself"
+            return
         }
+
+        lastMirrorError = ""
+
+        // Close the Control Center so it doesn't stay open below the fullscreen wl-mirror window
+        PopoutService.closeControlCenter()
+        // Same for this widget's bar popout: left open it keeps keyboard focus until Esc
+        root.closePopout()
+
+        MirrorState.startMirror(source, target, root.scalingMode, root.scalingFilter)
     }
-    
+
+    // Target captured when region selection starts (the picker may change meanwhile)
+    property string regionTarget: ""
+
+    // Starts an interactive drag-select (via slurp) and mirrors just that region onto the selected target
+    function startMirrorRegion() {
+        if (!root.wlMirrorInstalled) {
+            lastMirrorError = "wl-mirror is not installed"
+            Quickshell.execDetached(["sh", "-c", "notify-send 'Display Mirror' 'wl-mirror is not installed. Please install it first.' -u critical"])
+            return
+        }
+        if (!root.slurpInstalled) {
+            lastMirrorError = "slurp is not installed"
+            Quickshell.execDetached(["sh", "-c", "notify-send 'Display Mirror' 'slurp is not installed. Please install it first.' -u critical"])
+            return
+        }
+        if (!root.targetChoice) {
+            lastMirrorError = "No target display selected"
+            return
+        }
+
+        root.regionTarget = root.targetChoice
+
+        // Close popouts first so they don't obstruct (or steal input from) the
+        // region-selection overlay - give the close animation a moment to finish
+        PopoutService.closeControlCenter()
+        slurpLaunchDelay.start()
+    }
+
+    function onRegionSelected(regionStr) {
+        const targetOutput = root.regionTarget
+        if (!targetOutput) {
+            lastMirrorError = "No target display selected"
+            return
+        }
+
+        const sourceLabel = screenForRegion(regionStr) || "Selection"
+        if (sourceLabel === targetOutput) {
+            lastMirrorError = "Cannot mirror a region of " + targetOutput + " onto itself"
+            return
+        }
+
+        lastMirrorError = ""
+        MirrorState.startMirror(sourceLabel, targetOutput, root.scalingMode, root.scalingFilter, regionStr)
+    }
+
+    function stopMirror(id) {
+        MirrorState.stopMirror(id)
+    }
+
     function stopAllMirrors() {
-        console.log("DisplayMirror: Stopping all mirrors")
-        // Always reference MirrorState directly to avoid breaking binding
-        const pids = Object.keys(MirrorState.activeMirrors)
-        for (let i = 0; i < pids.length; i++) {
-            const pid = pids[i]
-            Quickshell.execDetached(["sh", "-c", "kill " + pid + " 2>/dev/null"])
-        }
-        // Clear via singleton; do not assign root.activeMirrors which would sever binding
-        MirrorState.activeMirrors = {}
-        Quickshell.execDetached(["sh", "-c", "notify-send 'Display Mirror' 'All mirrors stopped' -u low"])
+        MirrorState.stopAllMirrors()
     }
 
-    function checkMirrorStatus() {
-        console.log("DisplayMirror: Checking status of", activeMirrorCount, "mirrors")
-    const pids = Object.keys(MirrorState.activeMirrors)
-        for (let i = 0; i < pids.length; i++) {
-            const pid = pids[i]
-            verifyMirrorProcess.command = ["sh", "-c", "ps -p " + pid + " -o pid= || true"]
-            verifyMirrorProcess.tag = pid  // Store which PID we're checking
-            verifyMirrorProcess.running = true
-        }
+    // Adjusts scaling live on a running mirror (no restart), via MirrorState/wl-mirror's --stream mode
+    function setMirrorScaling(id, mode, filter) {
+        MirrorState.setScaling(id, mode, filter)
+    }
+
+    // Adjusts zoom live on a running mirror (no restart). zoomPercent is 100-200 (1x-2x).
+    function setMirrorZoom(id, zoomPercent) {
+        MirrorState.setZoom(id, zoomPercent)
     }
 
     Process {
@@ -255,74 +513,62 @@ PluginComponent {
     }
 
     Process {
-        id: mirrorProcess
-        command: ["sh", "-c", ""]
+        id: slurpCheckProcess
+        command: ["sh", "-c", "command -v slurp"]
         running: false
 
         stdout: SplitParser {
             onRead: data => {
-                const pid = data.trim()
-                lastMirrorOutput = pid
-                // Add mirror with source and target we just started
-                if (lastStartedSource && pid && currentFocusedOutput) {
-                    root.addMirror(pid, lastStartedSource, currentFocusedOutput)
+                if (data.trim().length > 0) {
+                    root.slurpInstalled = true
                 }
             }
         }
 
         onExited: (exitCode, exitStatus) => {
-            root.isLoading = false
-            const pid = lastMirrorOutput
-            if (pid && lastStartedSource) {
-                // Verify the process actually exists
-                verifyMirrorProcess.command = ["sh", "-c", "ps -p " + pid + " -o pid= || true"]
-                verifyMirrorProcess.tag = pid
-                verifyMirrorProcess.running = true
-            } else if (exitCode !== 0) {
-                console.warn("DisplayMirror: Failed to start mirror, exit code:", exitCode)
-                lastMirrorError = "Failed to start wl-mirror (exit " + exitCode + ")"
-                Quickshell.execDetached(["sh", "-c", "notify-send 'Display Mirror' 'Failed to start mirror' -u critical"])
-                justStartedMirror = false
-                lastStartedSource = ""
+            if (exitCode !== 0) {
+                root.slurpInstalled = false
+                console.warn("DisplayMirror: slurp is not installed")
             }
         }
     }
 
-    Process {
-        id: verifyMirrorProcess
-        command: ["sh", "-c", ""]
-        running: false
-        property string tag: ""  // Store which PID we're verifying
-        
-        stdout: SplitParser {
-            onRead: data => {
-                const exists = data.trim().length > 0
-                const pid = verifyMirrorProcess.tag
-                console.log("DisplayMirror: Verify result for PID", pid, "- exists:", exists)
-                
-                if (exists && root.justStartedMirror && pid === root.lastMirrorOutput) {
-                    // Only send notification when we actually started a mirror
-                    const mirror = MirrorState.activeMirrors[pid]
-                    if (mirror) {
-                        Quickshell.execDetached(["sh", "-c", "notify-send 'Display Mirror' 'Now mirroring " + mirror.source + " → " + mirror.target + "' -u low"])
-                    }
-                    root.justStartedMirror = false
-                    root.lastStartedSource = ""
-                } else if (!exists) {
-                    if (root.justStartedMirror && pid === root.lastMirrorOutput) {
-                        lastMirrorError = "wl-mirror process vanished immediately"
-                        Quickshell.execDetached(["sh", "-c", "notify-send 'Display Mirror' 'Mirror failed (no process)' -u critical"])
-                        root.justStartedMirror = false
-                        root.lastStartedSource = ""
-                    } else {
-                        lastMirrorError = "wl-mirror process vanished"
-                    }
-                    // Remove the dead mirror
-                    if (pid) {
-                        root.removeMirror(pid)
-                    }
-                }
-            }
+    // slurp must run as a fully detached process (like screenRecorderLH does), not
+    // as a Quickshell-managed child - a managed Process's selection overlay does
+    // not reliably get keyboard/pointer focus from the compositor. Since detached
+    // processes have no stdout capture, the result is written to a file instead
+    // and picked up here via a watched FileView.
+    readonly property string slurpResultPath: "/tmp/dms-display-mirror-region.txt"
+    property bool awaitingRegionResult: false
+
+    FileView {
+        id: slurpResultFile
+        path: root.slurpResultPath
+        watchChanges: true
+
+        function tryConsume() {
+            if (!root.awaitingRegionResult)
+                return
+            const region = text().trim()
+            console.warn("DisplayMirror: slurp result file contains:", JSON.stringify(region))
+            if (region.length === 0)
+                return
+            root.awaitingRegionResult = false
+            root.onRegionSelected(region)
+        }
+
+        onLoaded: tryConsume()
+        onLoadFailed: error => console.warn("DisplayMirror: could not read slurp result file:", error)
+        onFileChanged: reload()
+    }
+
+    Timer {
+        id: slurpLaunchDelay
+        interval: 200
+        onTriggered: {
+            root.awaitingRegionResult = true
+            console.warn("DisplayMirror: launching detached slurp")
+            Quickshell.execDetached(["sh", "-c", "slurp > '" + root.slurpResultPath + "'"])
         }
     }
 
@@ -332,7 +578,7 @@ PluginComponent {
             spacing: Theme.spacingXS
             DankIcon {
                 name: "screen_share"
-                size: Theme.iconSize - 6
+                size: root.iconSize
                 color: root.hasActiveMirrors ? Theme.primary : Theme.surfaceVariantText
                 anchors.verticalCenter: parent.verticalCenter
             }
@@ -352,7 +598,7 @@ PluginComponent {
             spacing: Theme.spacingXS
             DankIcon {
                 name: "screen_share"
-                size: Theme.iconSize - 6
+                size: root.iconSize
                 color: root.hasActiveMirrors ? Theme.primary : Theme.surfaceVariantText
                 anchors.horizontalCenter: parent.horizontalCenter
             }
@@ -374,32 +620,44 @@ PluginComponent {
             id: detailPopout
 
             headerText: "Display Mirror"
-            detailsText: hasActiveMirrors ? (activeMirrorCount + " display" + (activeMirrorCount > 1 ? "s" : "") + " currently being mirrored.") : (currentFocusedOutput ? "Choose an output to start mirroring on the current display" : "Select a display to mirror")
+            detailsText: hasActiveMirrors ? (activeMirrorCount + " display" + (activeMirrorCount > 1 ? "s" : "") + " currently being mirrored.") : "Pick a source and a target display"
             showCloseButton: true
 
             onVisibleChanged: {
                 if (visible) {
-                    console.log("DisplayMirror: Popout became visible, detecting focused output")
                     root.checkWlMirrorInstalled()
                     root.detectFocusedOutput()
-                    root.checkMirrorStatus()
                 }
             }
 
             Component.onCompleted: {
-                console.log("DisplayMirror: Popout opened, detecting focused output")
                 root.checkWlMirrorInstalled()
                 root.detectFocusedOutput()
-                root.checkMirrorStatus()
             }
 
-            // Refresh button
-            DankButton {
+            // Refresh + region-select buttons
+            Row {
                 width: parent.width
-                text: "Refresh Monitors"
-                iconName: "refresh"
-                onClicked: root.refreshMonitors()
-                enabled: !root.isLoading
+                spacing: Theme.spacingS
+
+                DankButton {
+                    width: (parent.width - Theme.spacingS) / 2
+                    text: "Refresh"
+                    iconName: "refresh"
+                    onClicked: root.refreshMonitors()
+                }
+
+                DankButton {
+                    width: (parent.width - Theme.spacingS) / 2
+                    text: "Select Region"
+                    iconName: "crop"
+                    onClicked: {
+                        // Close this popout first - it can otherwise sit on top of (and
+                        // intercept input meant for) slurp's selection overlay
+                        detailPopout.closePopout?.()
+                        root.startMirrorRegion()
+                    }
+                }
             }
 
             Item {
@@ -458,42 +716,6 @@ PluginComponent {
                 visible: !root.wlMirrorInstalled
             }
 
-            // Loading indicator
-            StyledRect {
-                width: parent.width
-                height: 40
-                radius: Theme.cornerRadius
-                color: Theme.surfaceContainerHigh
-                visible: root.isLoading
-
-                Row {
-                    anchors.centerIn: parent
-                    spacing: Theme.spacingS
-
-                    DankIcon {
-                        name: "sync"
-                        size: Theme.iconSize
-                        color: Theme.primary
-                        anchors.verticalCenter: parent.verticalCenter
-
-                        RotationAnimation on rotation {
-                            from: 0
-                            to: 360
-                            duration: 1000
-                            loops: Animation.Infinite
-                            running: root.isLoading
-                        }
-                    }
-
-                    StyledText {
-                        text: "Loading displays..."
-                        font.pixelSize: Theme.fontSizeMedium
-                        color: Theme.surfaceText
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-            }
-
             Item {
                 width: 1
                 height: Theme.spacingS
@@ -512,57 +734,122 @@ PluginComponent {
                     delegate: Rectangle {
                         required property var modelData
                         required property int index
-                        
+
                         width: parent.width
-                        height: mirrorStatusRow.implicitHeight + Theme.spacingM * 2
+                        height: mirrorCardColumn.implicitHeight + Theme.spacingM * 2
                         radius: Theme.cornerRadius
                         color: Theme.primaryPressed
                         border.width: 2
                         border.color: Theme.primary
 
-                        RowLayout {
-                            id: mirrorStatusRow
+                        Column {
+                            id: mirrorCardColumn
                             anchors.fill: parent
                             anchors.margins: Theme.spacingM
-                            spacing: Theme.spacingM
+                            spacing: Theme.spacingS
 
-                            DankIcon {
-                                name: "screen_share"
-                                size: Theme.iconSize
-                                color: Theme.primary
-                                Layout.alignment: Qt.AlignVCenter
-                            }
+                            RowLayout {
+                                id: mirrorStatusRow
+                                width: parent.width
+                                spacing: Theme.spacingM
 
-                            Column {
-                                spacing: 2
-                                Layout.alignment: Qt.AlignVCenter
-                                Layout.fillWidth: true
-                                
-                                StyledText {
-                                    text: {
-                                        const mirror = root.activeMirrors[modelData]
-                                        return mirror ? (mirror.source + " → " + mirror.target) : "Unknown"
-                                    }
-                                    font.pixelSize: Theme.fontSizeMedium
-                                    font.weight: Font.Medium
+                                DankIcon {
+                                    name: "screen_share"
+                                    size: Theme.iconSize
                                     color: Theme.primary
-                                    elide: Text.ElideRight
-                                    wrapMode: Text.NoWrap
-                                    width: parent.width
+                                    Layout.alignment: Qt.AlignVCenter
                                 }
-                                
-                                StyledText {
-                                    text: "PID: " + modelData
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    color: Theme.surfaceTextMedium
+
+                                Column {
+                                    spacing: 2
+                                    Layout.alignment: Qt.AlignVCenter
+                                    Layout.fillWidth: true
+
+                                    StyledText {
+                                        text: {
+                                            const mirror = root.activeMirrors[modelData]
+                                            return mirror ? (root.screenLabel(mirror.source) + " → " + root.screenLabel(mirror.target)) : "Unknown"
+                                        }
+                                        font.pixelSize: Theme.fontSizeMedium
+                                        font.weight: Font.Medium
+                                        color: Theme.primary
+                                        elide: Text.ElideRight
+                                        wrapMode: Text.NoWrap
+                                        width: parent.width
+                                    }
+
+                                    StyledText {
+                                        text: {
+                                            const mirror = root.activeMirrors[modelData]
+                                            return mirror ? (mirror.source + " → " + mirror.target + (mirror.pid ? "  ·  PID " + mirror.pid : "  ·  starting…")) : ""
+                                        }
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        color: Theme.surfaceTextMedium
+                                    }
+                                }
+
+                                DankButton {
+                                    text: "Stop"
+                                    iconName: "stop"
+                                    onClicked: root.stopMirror(modelData)
+                                    Layout.alignment: Qt.AlignVCenter
                                 }
                             }
 
-                            DankButton {
-                                text: "Stop"
-                                iconName: "stop"
-                                onClicked: root.stopMirror(modelData)
-                                Layout.alignment: Qt.AlignVCenter
+                            // Live scaling controls - applied immediately to the running mirror.
+                            // Stacked (not side-by-side) so labels never get squeezed/cut off.
+                            Column {
+                                width: parent.width
+                                spacing: Theme.spacingXS
+
+                                DankButtonGroup {
+                                    model: root.scalingModeLabels
+                                    size: "small"
+                                    checkEnabled: false
+                                    maximumWidth: parent.width
+                                    currentIndex: root.scalingModeValues.indexOf((root.activeMirrors[modelData] && root.activeMirrors[modelData].scalingMode) || "fit")
+                                    onSelectionChanged: (idx, selected) => {
+                                        if (!selected) return
+                                        const mirror = root.activeMirrors[modelData]
+                                        root.setMirrorScaling(modelData, root.scalingModeValues[idx], mirror ? mirror.scalingFilter : "linear")
+                                    }
+                                }
+
+                                DankButtonGroup {
+                                    model: root.scalingFilterLabels
+                                    size: "small"
+                                    checkEnabled: false
+                                    maximumWidth: parent.width
+                                    currentIndex: root.scalingFilterValues.indexOf((root.activeMirrors[modelData] && root.activeMirrors[modelData].scalingFilter) || "linear")
+                                    onSelectionChanged: (idx, selected) => {
+                                        if (!selected) return
+                                        const mirror = root.activeMirrors[modelData]
+                                        root.setMirrorScaling(modelData, mirror ? mirror.scalingMode : "fit", root.scalingFilterValues[idx])
+                                    }
+                                }
+
+                                // Continuous digital zoom (1x-2x): crops a centered region of the
+                                // source and lets the scaling mode above stretch it to fill the target
+                                DankSlider {
+                                    id: zoomSlider
+                                    width: parent.width
+                                    minimum: 100
+                                    maximum: 200
+                                    step: 5
+                                    unit: "%"
+                                    leftIcon: "zoom_out"
+                                    rightIcon: "zoom_in"
+                                    // Zoom crops a centered region of the whole source display; doesn't
+                                    // compose with a mirror that already started from a custom region
+                                    visible: !(root.activeMirrors[modelData] && root.activeMirrors[modelData].region)
+                                    onSliderValueChanged: newValue => root.setMirrorZoom(modelData, newValue)
+                                    onSliderDragFinished: finalValue => root.setMirrorZoom(modelData, finalValue)
+
+                                    Binding on value {
+                                        value: Math.round(((root.activeMirrors[modelData] && root.activeMirrors[modelData].zoom) || 1) * 100)
+                                        when: !zoomSlider.isDragging
+                                    }
+                                }
                             }
                         }
                     }
@@ -574,133 +861,10 @@ PluginComponent {
                 height: Theme.spacingS
             }
 
-            // Scrollable list of available displays
-            MouseArea {
-                id: scrollArea
+            // Source / target picker (all monitors, independent of focus)
+            MirrorPicker {
                 width: parent.width
-                height: 200
-                acceptedButtons: Qt.NoButton
-                propagateComposedEvents: true
                 visible: root.wlMirrorInstalled
-
-                onWheel: wheel => {
-                    const deltaY = wheel.angleDelta.y
-                    const scrollAmount = deltaY > 0 ? -60 : 60
-                    displayFlickable.contentY = Math.max(0, Math.min(displayFlickable.contentHeight - displayFlickable.height, displayFlickable.contentY + scrollAmount))
-                    wheel.accepted = true
-                }
-
-                DankFlickable {
-                    id: displayFlickable
-                    anchors.fill: parent
-                    contentHeight: displayColumn.height
-                    clip: true
-
-                    Column {
-                        id: displayColumn
-                        width: parent.width
-                        spacing: Theme.spacingS
-
-                        // Empty state
-                        Item {
-                            width: parent.width
-                            height: filteredMonitors().length === 0 && !root.isLoading ? 160 : 0
-                            visible: height > 0
-
-                            Column {
-                                anchors.centerIn: parent
-                                spacing: Theme.spacingS
-
-                                DankIcon {
-                                    name: root.monitors.length === 0 ? "monitor_off" : "check_circle"
-                                    size: Theme.iconSize + 16
-                                    color: Theme.surfaceVariantText
-                                    anchors.horizontalCenter: parent.horizontalCenter
-                                }
-
-                                StyledText {
-                                    text: root.monitors.length === 0 ? "No displays found" : "No displays available"
-                                    font.pixelSize: Theme.fontSizeMedium
-                                    color: Theme.surfaceText
-                                    anchors.horizontalCenter: parent.horizontalCenter
-                                }
-
-                                StyledText {
-                                    text: "Make sure a DMS compatible compositor is running"
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    color: Theme.surfaceVariantText
-                                    anchors.horizontalCenter: parent.horizontalCenter
-                                    visible: root.monitors.length === 0
-                                }
-                            }
-                        }
-
-                        // Display list
-                        Repeater {
-                            model: filteredMonitors()
-
-                            delegate: Rectangle {
-                                required property var modelData
-                                required property int index
-                                
-                                width: parent.width
-                                height: 50
-                                radius: Theme.cornerRadius
-                                color: monitorArea.containsMouse ? Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.08) : Theme.surfaceLight
-                                border.color: Theme.outlineLight
-                                border.width: 1
-
-                                RowLayout {
-                                    anchors.fill: parent
-                                    anchors.margins: Theme.spacingM
-                                    spacing: Theme.spacingM
-
-                                    DankIcon {
-                                        name: "monitor"
-                                        size: Theme.iconSize
-                                        color: Theme.primary
-                                        Layout.alignment: Qt.AlignVCenter
-                                    }
-
-                                    Column {
-                                        spacing: 2
-                                        Layout.alignment: Qt.AlignVCenter
-                                        Layout.fillWidth: true
-
-                                        StyledText {
-                                            text: modelData
-                                            font.pixelSize: Theme.fontSizeMedium
-                                            font.weight: Font.Medium
-                                            color: Theme.surfaceText
-                                            elide: Text.ElideRight
-                                            wrapMode: Text.NoWrap
-                                            width: parent.width
-                                        }
-
-                                        StyledText {
-                                            text: "Click to mirror"
-                                            font.pixelSize: Theme.fontSizeSmall
-                                            color: Theme.surfaceVariantText
-                                        }
-                                    }
-
-                                    Item {
-                                        Layout.fillWidth: true
-                                        height: 1
-                                    }
-                                }
-
-                                MouseArea {
-                                    id: monitorArea
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: root.startMirror(modelData)
-                                }
-                            }
-                        }
-                    }
-                }
             }
 
             // Error display
@@ -755,18 +919,6 @@ PluginComponent {
             border.color: Qt.rgba(Theme.outline.r, Theme.outline.g, Theme.outline.b, 0.08)
             border.width: 0
 
-            onVisibleChanged: {
-                if (visible) {
-                    console.log("DisplayMirror: CC Detail became visible, checking mirror status")
-                    root.checkMirrorStatus()
-                }
-            }
-
-            Component.onCompleted: {
-                console.log("DisplayMirror: CC Detail opened, checking mirror status")
-                root.checkMirrorStatus()
-            }
-
             Row {
                 id: headerRow
                 anchors.left: parent.left
@@ -799,7 +951,6 @@ PluginComponent {
                         root.refreshMonitors()
                         root.detectFocusedOutput()
                     }
-                    enabled: !root.isLoading
                     anchors.verticalCenter: parent.verticalCenter
                 }
             }
@@ -821,6 +972,14 @@ PluginComponent {
                     id: ccContentColumn
                     width: parent.width
                     spacing: Theme.spacingM
+
+                // Region-select button
+                DankButton {
+                    width: parent.width
+                    text: "Select Region to Mirror"
+                    iconName: "crop"
+                    onClicked: root.startMirrorRegion()
+                }
 
                 // wl-mirror not installed warning
                 StyledRect {
@@ -867,50 +1026,14 @@ PluginComponent {
                     }
                 }
 
-                // Loading indicator
-                StyledRect {
-                    width: parent.width
-                    height: 40
-                    radius: Theme.cornerRadius
-                    color: Theme.surfaceContainerHigh
-                    visible: root.isLoading
-
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: Theme.spacingS
-
-                        DankIcon {
-                            name: "sync"
-                            size: Theme.iconSize
-                            color: Theme.primary
-                            anchors.verticalCenter: parent.verticalCenter
-
-                            RotationAnimation on rotation {
-                                from: 0
-                                to: 360
-                                duration: 1000
-                                loops: Animation.Infinite
-                                running: root.isLoading
-                            }
-                        }
-
-                        StyledText {
-                            text: "Loading displays..."
-                            font.pixelSize: Theme.fontSizeMedium
-                            color: Theme.surfaceText
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-                }
-
                 // Info text (CC detail)
                 StyledText {
                     width: parent.width - Theme.spacingM * 2
-                    text: hasActiveMirrors ? (activeMirrorCount + " display" + (activeMirrorCount > 1 ? "s" : "") + " currently being mirrored.") : (currentFocusedOutput ? "Choose an output to start mirroring on the current display" : "Select a display to mirror")
+                    text: hasActiveMirrors ? (activeMirrorCount + " display" + (activeMirrorCount > 1 ? "s" : "") + " currently being mirrored.") : "Pick a source and a target display"
                     font.pixelSize: Theme.fontSizeSmall
                     color: Theme.surfaceVariantText
                     wrapMode: Text.WordWrap
-                    visible: filteredMonitors().length > 0 && !root.isLoading && root.wlMirrorInstalled
+                    visible: root.wlMirrorInstalled
                     bottomPadding: Theme.spacingS
                 }
 
@@ -918,70 +1041,133 @@ PluginComponent {
                 Column {
                     width: parent.width
                     spacing: Theme.spacingS
-                    
+
                     Repeater {
                         model: Object.keys(MirrorState.activeMirrors)
-                        
+
                         delegate: Rectangle {
                             required property var modelData
                             required property int index
-                            
+
                             width: parent.width
-                            height: mirrorRowCCDetail.implicitHeight + Theme.spacingM * 2
+                            height: mirrorCardColumnCC.implicitHeight + Theme.spacingM * 2
                             radius: Theme.cornerRadius
                             color: Theme.primaryPressed
                             border.width: 2
                             border.color: Theme.primary
-                            
-                            RowLayout {
-                                id: mirrorRowCCDetail
+
+                            Column {
+                                id: mirrorCardColumnCC
                                 anchors.fill: parent
                                 anchors.margins: Theme.spacingM
-                                spacing: Theme.spacingM
-                                
-                                DankIcon {
-                                    name: "screen_share"
-                                    size: Theme.iconSize
-                                    color: Theme.primary
-                                    Layout.alignment: Qt.AlignVCenter
-                                }
-                                
-                                Column {
-                                    spacing: 2
-                                    Layout.alignment: Qt.AlignVCenter
-                                    Layout.fillWidth: true
-                                    
-                                    StyledText {
-                                        text: {
-                                            const mirror = root.activeMirrors[modelData]
-                                            return mirror ? (mirror.source + " → " + mirror.target) : "Unknown"
-                                        }
-                                        font.pixelSize: Theme.fontSizeMedium
-                                        font.weight: Font.Medium
+                                spacing: Theme.spacingS
+
+                                RowLayout {
+                                    id: mirrorRowCCDetail
+                                    width: parent.width
+                                    spacing: Theme.spacingM
+
+                                    DankIcon {
+                                        name: "screen_share"
+                                        size: Theme.iconSize
                                         color: Theme.primary
-                                        elide: Text.ElideRight
-                                        wrapMode: Text.NoWrap
-                                        width: parent.width
+                                        Layout.alignment: Qt.AlignVCenter
                                     }
-                                    
-                                    StyledText {
-                                        text: "PID: " + modelData
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.surfaceTextMedium
+
+                                    Column {
+                                        spacing: 2
+                                        Layout.alignment: Qt.AlignVCenter
+                                        Layout.fillWidth: true
+
+                                        StyledText {
+                                            text: {
+                                                const mirror = root.activeMirrors[modelData]
+                                                return mirror ? (root.screenLabel(mirror.source) + " → " + root.screenLabel(mirror.target)) : "Unknown"
+                                            }
+                                            font.pixelSize: Theme.fontSizeMedium
+                                            font.weight: Font.Medium
+                                            color: Theme.primary
+                                            elide: Text.ElideRight
+                                            wrapMode: Text.NoWrap
+                                            width: parent.width
+                                        }
+
+                                        StyledText {
+                                            text: {
+                                                const mirror = root.activeMirrors[modelData]
+                                                return mirror ? (mirror.source + " → " + mirror.target + (mirror.pid ? "  ·  PID " + mirror.pid : "  ·  starting…")) : ""
+                                            }
+                                            font.pixelSize: Theme.fontSizeSmall
+                                            color: Theme.surfaceTextMedium
+                                        }
+                                    }
+
+                                    DankButton {
+                                        id: stopButtonCCDetail
+                                        text: "Stop"
+                                        iconName: "stop"
+                                        onClicked: root.stopMirror(modelData)
+                                        Layout.alignment: Qt.AlignVCenter
                                     }
                                 }
-                                
-                                DankButton {
-                                    id: stopButtonCCDetail
-                                    text: "Stop"
-                                    iconName: "stop"
-                                    onClicked: root.stopMirror(modelData)
-                                    Layout.alignment: Qt.AlignVCenter
+
+                                // Live scaling controls - applied immediately to the running mirror.
+                                // Stacked (not side-by-side) so labels never get squeezed/cut off.
+                                Column {
+                                    width: parent.width
+                                    spacing: Theme.spacingXS
+
+                                    DankButtonGroup {
+                                        model: root.scalingModeLabels
+                                        size: "small"
+                                        checkEnabled: false
+                                        maximumWidth: parent.width
+                                        currentIndex: root.scalingModeValues.indexOf((root.activeMirrors[modelData] && root.activeMirrors[modelData].scalingMode) || "fit")
+                                        onSelectionChanged: (idx, selected) => {
+                                            if (!selected) return
+                                            const mirror = root.activeMirrors[modelData]
+                                            root.setMirrorScaling(modelData, root.scalingModeValues[idx], mirror ? mirror.scalingFilter : "linear")
+                                        }
+                                    }
+
+                                    DankButtonGroup {
+                                        model: root.scalingFilterLabels
+                                        size: "small"
+                                        checkEnabled: false
+                                        maximumWidth: parent.width
+                                        currentIndex: root.scalingFilterValues.indexOf((root.activeMirrors[modelData] && root.activeMirrors[modelData].scalingFilter) || "linear")
+                                        onSelectionChanged: (idx, selected) => {
+                                            if (!selected) return
+                                            const mirror = root.activeMirrors[modelData]
+                                            root.setMirrorScaling(modelData, mirror ? mirror.scalingMode : "fit", root.scalingFilterValues[idx])
+                                        }
+                                    }
+
+                                    // Continuous digital zoom (1x-2x): crops a centered region of the
+                                    // source and lets the scaling mode above stretch it to fill the target
+                                    DankSlider {
+                                        id: zoomSliderCC
+                                        width: parent.width
+                                        minimum: 100
+                                        maximum: 200
+                                        step: 5
+                                        unit: "%"
+                                        leftIcon: "zoom_out"
+                                        rightIcon: "zoom_in"
+                                        visible: !(root.activeMirrors[modelData] && root.activeMirrors[modelData].region)
+                                        onSliderValueChanged: newValue => root.setMirrorZoom(modelData, newValue)
+                                        onSliderDragFinished: finalValue => root.setMirrorZoom(modelData, finalValue)
+
+                                        Binding on value {
+                                            value: Math.round(((root.activeMirrors[modelData] && root.activeMirrors[modelData].zoom) || 1) * 100)
+                                            when: !zoomSliderCC.isDragging
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    
+
                     // Error display
                     StyledRect {
                         width: parent.width
@@ -989,24 +1175,24 @@ PluginComponent {
                         radius: Theme.cornerRadius
                         color: Theme.surfaceContainerHigh
                         visible: root.lastMirrorError !== ""
-                        
+
                         Column {
                             id: errorColumnCCDetail
                             anchors.fill: parent
                             anchors.margins: Theme.spacingM
                             spacing: Theme.spacingS
-                            
+
                             Row {
                                 width: parent.width
                                 spacing: Theme.spacingM
-                                
+
                                 DankIcon {
                                     name: "error"
                                     size: Theme.iconSize
                                     color: Theme.warning || Theme.error
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
-                                
+
                                 StyledText {
                                     text: "Mirror Error"
                                     font.pixelSize: Theme.fontSizeMedium
@@ -1015,7 +1201,7 @@ PluginComponent {
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
                             }
-                            
+
                             StyledText {
                                 text: "Attempted to start mirror. " + (root.lastMirrorError || "Unknown issue.")
                                 font.pixelSize: Theme.fontSizeSmall
@@ -1028,110 +1214,10 @@ PluginComponent {
                     }
                 }
 
-                // Monitor list (available displays)
-                Column {
+                // Source / target picker (all monitors, independent of focus)
+                MirrorPicker {
                     width: parent.width
-                    spacing: Theme.spacingS
-                    visible: filteredMonitors().length > 0 && !root.isLoading && root.wlMirrorInstalled
-
-                    Repeater {
-                        model: filteredMonitors()
-
-                        delegate: Rectangle {
-                            required property var modelData
-                            required property int index
-                            
-                            width: parent.width
-                            height: 60
-                            radius: Theme.cornerRadius
-                            color: monitorArea.containsMouse ? Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.08) : Theme.withAlpha(Theme.surfaceContainerHighest, Theme.popupTransparency)
-                            border.color: Theme.outline
-                            border.width: 0
-
-                            Row {
-                                anchors.fill: parent
-                                anchors.margins: Theme.spacingM
-                                spacing: Theme.spacingM
-
-                                DankIcon {
-                                    name: "monitor"
-                                    size: Theme.iconSize + 8
-                                    color: Theme.primary
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-
-                                Column {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    spacing: Theme.spacingXS
-                                    width: parent.width - Theme.iconSize - Theme.spacingM * 2
-
-                                    StyledText {
-                                        text: modelData
-                                        font.pixelSize: Theme.fontSizeMedium
-                                        font.weight: Font.Medium
-                                        color: Theme.surfaceText
-                                    }
-
-                                    StyledText {
-                                        text: "Click to start mirroring"
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.surfaceVariantText
-                                    }
-                                }
-
-                                Item {
-                                    width: 1
-                                    height: 1
-                                }
-                            }
-
-                            MouseArea {
-                                id: monitorArea
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: {
-                                    root.startMirror(modelData)
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Empty state (CC detail)
-                StyledRect {
-                    width: parent.width
-                    height: 100
-                    radius: Theme.cornerRadius
-                    color: Theme.surfaceContainerHigh
-                    visible: filteredMonitors().length === 0 && !root.isLoading && root.wlMirrorInstalled
-
-                    Column {
-                        anchors.centerIn: parent
-                        spacing: Theme.spacingS
-
-                        DankIcon {
-                            name: root.monitors.length === 0 ? "monitor_off" : "check_circle"
-                            size: Theme.iconSize + 16
-                            color: Theme.surfaceVariantText
-                            anchors.horizontalCenter: parent.horizontalCenter
-                        }
-
-                        StyledText {
-                            text: root.monitors.length === 0 ? "No displays found" : "No displays available"
-                            font.pixelSize: Theme.fontSizeMedium
-                            color: Theme.surfaceText
-                            anchors.horizontalCenter: parent.horizontalCenter
-                        }
-
-                        StyledText {
-                            text: "Make sure a DMS compatible compositor is running"
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: Theme.surfaceVariantText
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            visible: root.monitors.length === 0
-                        }
-                    }
+                    visible: root.wlMirrorInstalled
                 }
             }
         }
