@@ -8,6 +8,8 @@ A DankMaterialShell plugin that provides an easy interface to mirror displays us
 
 - **Easy Display Selection** - Browse available displays directly from the Control Center
 - **Auto-refresh** - Automatically detects monitor changes and updates the display list
+- **Live Scaling Controls** - Each active mirror has its own Fit/Cover/Exact fit mode, Linear/Nearest filter, and a 1x-2x digital zoom slider, all applied instantly to the running mirror (no restart)
+- **Region Selection** - Drag-select any custom area to mirror instead of a whole display (requires slurp)
 - **One-Click Mirroring** - Start screen mirroring with a single click
 - **Quick Stop** - Stop active mirror sessions instantly
 - **Bar Widget** - Show mirroring status and control from the DankBar
@@ -44,6 +46,7 @@ Then:
 
 - **DankMaterialShell** >= 0.1.0
 - **wl-mirror** - Wayland screen mirroring utility
+- **slurp** (optional) - only needed for the "Select Region" custom-area picker
 - A **DMS-supported compositor** (niri, Hyprland, sway, dwl, …)
 
 ### Installing wl-mirror
