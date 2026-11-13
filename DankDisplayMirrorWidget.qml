@@ -578,7 +578,7 @@ PluginComponent {
             spacing: Theme.spacingXS
             DankIcon {
                 name: "screen_share"
-                size: Theme.iconSize - 6
+                size: root.iconSize
                 color: root.hasActiveMirrors ? Theme.primary : Theme.surfaceVariantText
                 anchors.verticalCenter: parent.verticalCenter
             }
@@ -598,7 +598,7 @@ PluginComponent {
             spacing: Theme.spacingXS
             DankIcon {
                 name: "screen_share"
-                size: Theme.iconSize - 6
+                size: root.iconSize
                 color: root.hasActiveMirrors ? Theme.primary : Theme.surfaceVariantText
                 anchors.horizontalCenter: parent.horizontalCenter
             }
