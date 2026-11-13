@@ -102,8 +102,6 @@ QtObject {
         const mirrors = Object.assign({}, activeMirrors)
         mirrors[id] = Object.assign({}, mirror, {scalingMode: mode, scalingFilter: filter})
         activeMirrors = mirrors
-
-        Quickshell.execDetached(["sh", "-c", "notify-send 'Display Mirror' 'Scaling set to " + mode + " / " + filter + "' -u low"])
     }
 
     // Adjusts zoom on a running mirror live. wl-mirror has no direct zoom
