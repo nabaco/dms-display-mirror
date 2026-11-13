@@ -421,6 +421,8 @@ PluginComponent {
 
         // Close the Control Center so it doesn't stay open below the fullscreen wl-mirror window
         PopoutService.closeControlCenter()
+        // Same for this widget's bar popout: left open it keeps keyboard focus until Esc
+        root.closePopout()
 
         MirrorState.startMirror(source, target, root.scalingMode, root.scalingFilter)
     }
